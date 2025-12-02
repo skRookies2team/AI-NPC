@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from langchain_community.document_loaders import TextLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
+from langchain_community.vectorstores import PGVector
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
@@ -16,9 +16,13 @@ from langchain_core.output_parsers import StrOutputParser
 # 1. 환경변수 로드 (.env 파일에서 API 키 가져옴)
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+POSTGRES_CONNECTION_STRING = os.getenv("POSTGRES_CONNECTION_STRING")
 
 if not OPENAI_API_KEY:
     raise ValueError(".env 파일에 OPENAI_API_KEY가 설정되지 않았습니다.")
+
+if not POSTGRES_CONNECTION_STRING:
+    raise ValueError(".env 파일에 POSTGRES_CONNECTION_STRING이 설정되지 않았습니다.")
 
 app = FastAPI()
 
@@ -53,7 +57,16 @@ async def train_novel(
 
         # 임베딩 및 벡터 저장 (서버의 환경변수 키 사용)
         embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-        vectorstore = Chroma.from_documents(documents=splits, embedding=embeddings)
+        
+        # PostgreSQL Vector Store 사용
+        collection_name = f"session_{session_id}"
+        vectorstore = PGVector.from_documents(
+            documents=splits,
+            embedding=embeddings,
+            collection_name=collection_name,
+            connection_string=POSTGRES_CONNECTION_STRING,
+            use_jsonb=True  # JSONB 사용으로 성능 향상
+        )
         
         vector_store_mapping[session_id] = vectorstore.as_retriever()
         
