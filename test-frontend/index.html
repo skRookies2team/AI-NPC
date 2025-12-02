@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI 소설 캐릭터 챗봇</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f3f4f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .container { width: 100%; max-width: 450px; background: white; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); overflow: hidden; display: flex; flex-direction: column; height: 80vh; }
+        header { background-color: #6366f1; color: white; padding: 15px; text-align: center; font-weight: bold; }
+        
+        /* 설정 화면 */
+        #setup-section { padding: 30px; display: flex; flex-direction: column; gap: 15px; justify-content: center; height: 100%; }
+        input[type="text"], input[type="file"] { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; }
+        button { background-color: #6366f1; color: white; border: none; padding: 12px; border-radius: 8px; cursor: pointer; font-size: 1rem; font-weight: bold; transition: 0.2s; }
+        button:hover { background-color: #4f46e5; }
+        button:disabled { background-color: #a5a6f6; cursor: not-allowed; }
+
+        /* 채팅 화면 */
+        #chat-section { display: none; flex-direction: column; height: 100%; }
+        #chat-box { flex: 1; padding: 20px; overflow-y: auto; background-color: #fff; display: flex; flex-direction: column; gap: 10px; }
+        .message { max-width: 80%; padding: 10px 15px; border-radius: 15px; font-size: 0.95rem; line-height: 1.4; word-wrap: break-word; }
+        .bot-msg { align-self: flex-start; background-color: #f3f4f6; color: #333; border-bottom-left-radius: 2px; }
+        .user-msg { align-self: flex-end; background-color: #e0e7ff; color: #3730a3; border-bottom-right-radius: 2px; }
+        
+        .input-area { padding: 15px; border-top: 1px solid #eee; display: flex; gap: 10px; }
+        .input-area input { flex: 1; border-radius: 20px; outline: none; }
+        .input-area button { border-radius: 20px; width: 80px; }
+        .loading { font-size: 0.8rem; color: #888; margin-left: 20px; display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <header>📚 Novel Persona Chat</header>
+
+    <div id="setup-section">
+        <h3>캐릭터 생성</h3>
+        <input type="text" id="charName" placeholder="주인공 이름 (예: 해리포터)">
+        <input type="file" id="novelFile" accept=".txt">
+        <button id="startBtn" onclick="uploadAndStart()">대화 시작하기</button>
+        <p id="status-msg" style="text-align: center; font-size: 0.9rem; color: #666;"></p>
+    </div>
+
+    <div id="chat-section">
+        <div id="chat-box"></div>
+        <div id="loading" class="loading">답변 작성 중...</div>
+        <div class="input-area">
+            <input type="text" id="userMessage" placeholder="메시지를 입력하세요..." onkeypress="if(event.key==='Enter') sendMessage()">
+            <button onclick="sendMessage()">전송</button>
+        </div>
+    </div>
+</div>
+
+<script>
+    const BACKEND_URL = "http://localhost:3000"; // Node.js 서버 주소
+    let currentSessionId = null;
+
+    async function uploadAndStart() {
+        const charName = document.getElementById('charName').value;
+        const fileInput = document.getElementById('novelFile');
+        const btn = document.getElementById('startBtn');
+        const status = document.getElementById('status-msg');
+
+        if (!charName || !fileInput.files[0]) {
+            alert("이름과 파일을 모두 입력해주세요.");
+            return;
+        }
+
+        btn.disabled = true;
+        btn.innerText = "학습 중...";
+        status.innerText = "소설을 읽고 캐릭터를 만드는 중입니다...";
+
+        const formData = new FormData();
+        formData.append("file", fileInput.files[0]);
+        formData.append("character_name", charName);
+
+        try {
+            const response = await fetch(`${BACKEND_URL}/upload`, {
+                method: "POST",
+                body: formData
+            });
+            const data = await response.json();
+
+            if (data.success) {
+                currentSessionId = data.session_id;
+                document.getElementById('setup-section').style.display = 'none';
+                document.getElementById('chat-section').style.display = 'flex';
+                addMessage('bot', `안녕! 나는 ${charName}. 무엇이 궁금해?`);
+            } else {
+                alert("실패: " + data.message);
+                btn.disabled = false;
+            }
+        } catch (error) {
+            console.error(error);
+            alert("서버 연결 실패");
+            btn.disabled = false;
+        }
+    }
+
+    async function sendMessage() {
+        const input = document.getElementById('userMessage');
+        const message = input.value.trim();
+        if (!message) return;
+
+        addMessage('user', message);
+        input.value = '';
+        document.getElementById('loading').style.display = 'block';
+
+        try {
+            const response = await fetch(`${BACKEND_URL}/chat`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    message: message,
+                    session_id: currentSessionId
+                })
+            });
+            const data = await response.json();
+            
+            document.getElementById('loading').style.display = 'none';
+            addMessage('bot', data.reply);
+        } catch (error) {
+            document.getElementById('loading').style.display = 'none';
+            addMessage('bot', "통신 오류가 발생했습니다.");
+        }
+    }
+
+    function addMessage(sender, text) {
+        const chatBox = document.getElementById('chat-box');
+        const div = document.createElement('div');
+        div.className = `message ${sender === 'user' ? 'user-msg' : 'bot-msg'}`;
+        div.innerText = text;
+        chatBox.appendChild(div);
+        chatBox.scrollTop = chatBox.scrollHeight;
+    }
+</script>
+
+</body>
+</html>
