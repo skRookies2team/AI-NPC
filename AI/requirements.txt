@@ -10,3 +10,5 @@ openai
 pydantic
 pgvector
 psycopg2-binary
+ragas
+datasets

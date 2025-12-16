@@ -43,6 +43,10 @@
     </div>
 
     <div id="chat-section">
+        <div id="session-info" style="padding: 10px 15px; background-color: #f9fafb; border-bottom: 1px solid #eee; font-size: 0.85rem; color: #666;">
+            <strong>세션 ID:</strong> <span id="session-id-display" style="font-family: monospace; color: #6366f1;">-</span>
+            <button onclick="copySessionId()" style="margin-left: 10px; padding: 4px 8px; font-size: 0.75rem; background-color: #6366f1; color: white; border: none; border-radius: 4px; cursor: pointer;">복사</button>
+        </div>
         <div id="chat-box"></div>
         <div id="loading" class="loading">답변 작성 중...</div>
         <div class="input-area">
@@ -84,6 +88,8 @@
 
             if (data.success) {
                 currentSessionId = data.session_id;
+                // 세션 ID 표시
+                document.getElementById('session-id-display').textContent = currentSessionId;
                 document.getElementById('setup-section').style.display = 'none';
                 document.getElementById('chat-section').style.display = 'flex';
                 addMessage('bot', `안녕! 나는 ${charName}. 무엇이 궁금해?`);
@@ -133,6 +139,23 @@
         div.innerText = text;
         chatBox.appendChild(div);
         chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    function copySessionId() {
+        if (currentSessionId) {
+            navigator.clipboard.writeText(currentSessionId).then(() => {
+                const btn = event.target;
+                const originalText = btn.textContent;
+                btn.textContent = '복사됨!';
+                btn.style.backgroundColor = '#10b981';
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.backgroundColor = '#6366f1';
+                }, 2000);
+            }).catch(err => {
+                alert('복사 실패: ' + err);
+            });
+        }
     }
 </script>
 
