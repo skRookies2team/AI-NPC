@@ -23,6 +23,15 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 POSTGRES_CONNECTION_STRING = os.getenv("POSTGRES_CONNECTION_STRING")
 
+# AWS 자격 증명 (환경변수에서 가져오기)
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_KEY")
+AWS_REGION = os.getenv("AWS_S3_REGION", "ap-northeast-2")
+S3_BUCKET = os.getenv("AWS_S3_BUCKET")  # S3 버킷 이름 (환경변수에서만 가져옴)
+
+if not S3_BUCKET:
+    raise ValueError(".env 파일에 AWS_S3_BUCKET 또는 S3_BUCKET이 설정되지 않았습니다.")
+
 if not OPENAI_API_KEY:
     raise ValueError(".env 파일에 OPENAI_API_KEY가 설정되지 않았습니다.")
 
@@ -60,6 +69,10 @@ logger.addHandler(console_handler)
 logger.info("=" * 50)
 logger.info("AI 서버 시작")
 logger.info("=" * 50)
+logger.info(f"S3_BUCKET: {S3_BUCKET}")
+logger.info(f"AWS_REGION: {AWS_REGION}")
+logger.info(f"AWS_ACCESS_KEY 설정됨: {bool(AWS_ACCESS_KEY_ID)}")
+logger.info(f"AWS_SECRET_KEY 설정됨: {bool(AWS_SECRET_ACCESS_KEY)}")
 
 app = FastAPI()
 
@@ -114,11 +127,10 @@ class TrainFromS3Request(BaseModel):
     bucket: str  # S3 버킷 이름
     character_name: str
 
-class TrainFromS3Request(BaseModel):
+class CharacterRequest(BaseModel):
     session_id: str
-    file_key: str  # S3 파일 키
-    bucket: str  # S3 버킷 이름
     character_name: str
+    character_description: str = ""  # 선택적: 캐릭터의 성격, 특징 등 추가 정보
 
 @app.post("/api/ai/train")
 async def train_novel(
@@ -207,20 +219,44 @@ async def train_novel_from_s3(request: TrainFromS3Request):
     S3에서 파일을 다운로드하여 학습
     프론트엔드가 S3에 업로드한 파일을 다운로드하여 RAG 학습 진행
     """
-    logger.info(f"[TRAIN-FROM-S3] 시작 - session_id: {request.session_id}, file_key: {request.file_key}, bucket: {request.bucket}")
+    # 환경변수에서 버킷 이름 가져오기
+    bucket_name = S3_BUCKET
+    
+    logger.info(f"[TRAIN-FROM-S3] 시작 - session_id: {request.session_id}, file_key: {request.file_key}, bucket: {bucket_name}")
     file_path = None
     
     try:
         # boto3 임포트 확인
         try:
             import boto3
-            from botocore.exceptions import ClientError
+            from botocore.exceptions import ClientError, NoCredentialsError
         except ImportError:
             logger.error("boto3가 설치되지 않았습니다. pip install boto3를 실행해주세요.")
             raise HTTPException(status_code=500, detail="boto3가 설치되지 않았습니다.")
         
-        # S3 클라이언트 생성
-        s3_client = boto3.client('s3')
+        # S3 클라이언트 생성 (환경변수에서 자격 증명 읽기)
+        if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+            logger.error("AWS 자격 증명이 .env 파일에 설정되지 않았습니다.")
+            logger.error(f"AWS_ACCESS_KEY_ID: {bool(AWS_ACCESS_KEY_ID)}, AWS_SECRET_ACCESS_KEY: {bool(AWS_SECRET_ACCESS_KEY)}")
+            raise HTTPException(
+                status_code=500, 
+                detail="AWS 자격 증명이 설정되지 않았습니다. .env 파일에 AWS_ACCESS_KEY_ID와 AWS_SECRET_ACCESS_KEY를 추가하세요."
+            )
+        
+        try:
+            s3_client = boto3.client(
+                's3',
+                aws_access_key_id=AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+                region_name=AWS_REGION
+            )
+            logger.debug("환경변수에서 AWS 자격 증명 사용")
+        except Exception as e:
+            logger.error(f"S3 클라이언트 생성 실패: {str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"AWS S3 클라이언트 생성 실패: {str(e)}"
+            )
         
         # 임시 파일 경로 생성
         os.makedirs("temp_ai", exist_ok=True)
@@ -228,15 +264,15 @@ async def train_novel_from_s3(request: TrainFromS3Request):
         file_path = f"temp_ai/{request.session_id}_{filename}"
         
         # S3에서 파일 다운로드
-        logger.debug(f"S3에서 파일 다운로드 중 - bucket: {request.bucket}, key: {request.file_key}")
+        logger.debug(f"S3에서 파일 다운로드 중 - bucket: {bucket_name}, key: {request.file_key}")
         try:
-            s3_client.download_file(request.bucket, request.file_key, file_path)
+            s3_client.download_file(bucket_name, request.file_key, file_path)
             logger.info(f"파일 다운로드 완료 - {file_path}")
         except ClientError as e:
             logger.error(f"S3 파일 다운로드 실패 - error: {str(e)}")
             raise HTTPException(
                 status_code=404, 
-                detail=f"S3에서 파일을 찾을 수 없습니다. bucket: {request.bucket}, key: {request.file_key}"
+                detail=f"S3에서 파일을 찾을 수 없습니다. bucket: {bucket_name}, key: {request.file_key}"
             )
         
         # 텍스트 로드
@@ -311,6 +347,70 @@ async def train_novel_from_s3(request: TrainFromS3Request):
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
         raise HTTPException(status_code=500, detail=f"학습 중 오류 발생: {str(e)}")
+
+@app.post("/api/ai/character")
+async def set_character(request: CharacterRequest):
+    """
+    캐릭터 정보를 입력받아 시스템 프롬프트 설정
+    소설 학습과 별도로 캐릭터 정보만 업데이트할 수 있음
+    """
+    logger.info(f"[CHARACTER] 시작 - session_id: {request.session_id}, character_name: {request.character_name}")
+    
+    try:
+        session_id = request.session_id
+        character_name = request.character_name
+        character_description = request.character_description.strip() if request.character_description else ""
+        
+        # 캐릭터 설명이 있으면 추가, 없으면 기본 형식만 사용
+        if character_description:
+            system_prompt = f"""
+        당신은 소설 속 인물 '{character_name}'입니다.
+        
+        **캐릭터 정보:**
+        {character_description}
+        
+        **중요 규칙:**
+        1. 아래 [Context]에 있는 소설 내용만을 바탕으로 답변하세요.
+        2. [Context]에 없는 정보는 절대 만들어내지 마세요.
+        3. [Context]에 답변할 수 있는 정보가 없으면 "소설 내용에 그런 정보는 나오지 않습니다" 또는 "모르겠습니다"라고 솔직하게 말하세요.
+        4. 컨텍스트 밖의 일반 지식이나 추측을 사용하지 마세요.
+        5. 소설에 나오는 인물, 장소, 사건의 이름과 표현을 정확히 사용하세요.
+        6. 위에 명시된 캐릭터 정보와 소설 내용을 함께 고려하여 일관된 캐릭터로 답변하세요.
+        
+        [Context]:
+        {{context}}
+        """
+        else:
+            system_prompt = f"""
+        당신은 소설 속 인물 '{character_name}'입니다.
+        
+        **중요 규칙:**
+        1. 아래 [Context]에 있는 소설 내용만을 바탕으로 답변하세요.
+        2. [Context]에 없는 정보는 절대 만들어내지 마세요.
+        3. [Context]에 답변할 수 있는 정보가 없으면 "소설 내용에 그런 정보는 나오지 않습니다" 또는 "모르겠습니다"라고 솔직하게 말하세요.
+        4. 컨텍스트 밖의 일반 지식이나 추측을 사용하지 마세요.
+        5. 소설에 나오는 인물, 장소, 사건의 이름과 표현을 정확히 사용하세요.
+        
+        [Context]:
+        {{context}}
+        """
+        
+        # 시스템 프롬프트 저장
+        system_prompts[session_id] = system_prompt
+        logger.info(f"[CHARACTER] 완료 - session_id: {session_id}, character_name: {character_name}")
+        logger.debug(f"캐릭터 설명 길이: {len(character_description)} 문자")
+        
+        return {
+            "status": "character_set",
+            "session_id": session_id,
+            "character_name": character_name,
+            "message": "캐릭터 정보가 성공적으로 설정되었습니다."
+        }
+        
+    except Exception as e:
+        logger.error(f"[CHARACTER] 오류 발생 - session_id: {request.session_id}, error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"캐릭터 정보 설정 중 오류 발생: {str(e)}")
 
 @app.post("/api/ai/chat")
 async def chat(request: ChatRequest):
