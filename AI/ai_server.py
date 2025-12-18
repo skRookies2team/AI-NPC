@@ -3,7 +3,7 @@ import shutil
 import logging
 import traceback
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -131,87 +131,6 @@ class CharacterRequest(BaseModel):
     session_id: str
     character_name: str
     character_description: str = ""  # 선택적: 캐릭터의 성격, 특징 등 추가 정보
-
-@app.post("/api/ai/train")
-async def train_novel(
-    file: UploadFile = File(...),
-    session_id: str = Form(...),
-    character_name: str = Form(...)
-):
-    logger.info(f"[TRAIN] 시작 - session_id: {session_id}, character_name: {character_name}, filename: {file.filename}")
-    try:
-        # 파일 임시 저장
-        os.makedirs("temp_ai", exist_ok=True)
-        file_path = f"temp_ai/{session_id}_{file.filename}"
-        logger.debug(f"파일 임시 저장 중: {file_path}")
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # 텍스트 로드
-        logger.debug("텍스트 파일 로드 중...")
-        loader = TextLoader(file_path, encoding="utf-8")
-        docs = loader.load()
-        logger.info(f"로드된 문서 수: {len(docs)}, 총 문자 수: {sum(len(doc.page_content) for doc in docs)}")
-        
-        # 텍스트 청킹 (Chunking) - 최적화된 크기
-        # chunk_size: 800 (더 작은 청크로 정확도 향상)
-        # chunk_overlap: 150 (문맥 유지를 위한 적절한 오버랩)
-        logger.debug("텍스트 청킹 중...")
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=150,
-            separators=["\n\n", "\n", ". ", " ", ""]  # 문단 > 문장 > 단어 순서로 분할
-        )
-        splits = text_splitter.split_documents(docs)
-        logger.info(f"청킹 완료 - 총 {len(splits)}개 청크 생성")
-
-        # 임베딩 및 벡터 저장 (서버의 환경변수 키 사용)
-        logger.debug("임베딩 생성 및 벡터 저장소 생성 중...")
-        embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-        
-        # PostgreSQL Vector Store 사용
-        collection_name = f"session_{session_id}"
-        vectorstore = PGVector.from_documents(
-            documents=splits,
-            embedding=embeddings,
-            collection_name=collection_name,
-            connection_string=POSTGRES_CONNECTION_STRING,
-            use_jsonb=True  # JSONB 사용으로 성능 향상
-        )
-        logger.info(f"벡터 저장소 생성 완료 - collection: {collection_name}")
-        
-        # Retriever 설정: top_k 증가 (4 -> 6)로 더 많은 컨텍스트 검색
-        vector_store_mapping[session_id] = vectorstore.as_retriever(
-            search_kwargs={"k": 6}
-        )
-        
-        # 페르소나 프롬프트 설정 (범용적, 컨텍스트 기반 답변 강제)
-        system_prompts[session_id] = f"""
-        당신은 소설 속 인물 '{character_name}'입니다.
-        
-        **중요 규칙:**
-        1. 아래 [Context]에 있는 소설 내용만을 바탕으로 답변하세요.
-        2. [Context]에 없는 정보는 절대 만들어내지 마세요.
-        3. [Context]에 답변할 수 있는 정보가 없으면 "소설 내용에 그런 정보는 나오지 않습니다" 또는 "모르겠습니다"라고 솔직하게 말하세요.
-        4. 컨텍스트 밖의 일반 지식이나 추측을 사용하지 마세요.
-        5. 소설에 나오는 인물, 장소, 사건의 이름과 표현을 정확히 사용하세요.
-        
-        [Context]:
-        {{context}}
-        """
-        logger.debug(f"시스템 프롬프트 설정 완료 - character_name: {character_name}")
-        
-        # 임시 파일 삭제
-        os.remove(file_path)
-        logger.info(f"[TRAIN] 완료 - session_id: {session_id}")
-        return {"status": "trained", "session_id": session_id}
-
-    except Exception as e:
-        logger.error(f"[TRAIN] 오류 발생 - session_id: {session_id}, error: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        if os.path.exists(file_path):
-            os.remove(file_path)
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/ai/train-from-s3")
 async def train_novel_from_s3(request: TrainFromS3Request):
@@ -353,6 +272,7 @@ async def set_character(request: CharacterRequest):
     """
     캐릭터 정보를 입력받아 시스템 프롬프트 설정
     소설 학습과 별도로 캐릭터 정보만 업데이트할 수 있음
+    PostgreSQL에 벡터 스토어가 이미 존재하면 로드하여 대화 준비 완료
     """
     logger.info(f"[CHARACTER] 시작 - session_id: {request.session_id}, character_name: {request.character_name}")
     
@@ -360,6 +280,29 @@ async def set_character(request: CharacterRequest):
         session_id = request.session_id
         character_name = request.character_name
         character_description = request.character_description.strip() if request.character_description else ""
+        
+        # 기존 벡터 스토어가 PostgreSQL에 있는지 확인하고 로드
+        # (서버 재시작 등으로 메모리에 없을 수 있음)
+        if session_id not in vector_store_mapping:
+            logger.debug(f"메모리에 벡터 스토어 없음, PostgreSQL에서 로드 시도 - session_id: {session_id}")
+            try:
+                embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+                collection_name = f"session_{session_id}"
+                vectorstore = PGVector(
+                    collection_name=collection_name,
+                    connection_string=POSTGRES_CONNECTION_STRING,
+                    embedding_function=embeddings,
+                    use_jsonb=True
+                )
+                vector_store_mapping[session_id] = vectorstore.as_retriever(
+                    search_kwargs={"k": 6}
+                )
+                logger.info(f"PostgreSQL에서 벡터 스토어 로드 완료 - collection: {collection_name}")
+            except Exception as e:
+                logger.warning(f"PostgreSQL에서 벡터 스토어 로드 실패 - session_id: {session_id}, error: {str(e)}")
+                logger.warning("소설 학습(train-from-s3)이 먼저 필요합니다.")
+                # 벡터 스토어가 없어도 캐릭터 정보는 저장하도록 함
+                # (나중에 소설 학습하면 대화 가능)
         
         # 캐릭터 설명이 있으면 추가, 없으면 기본 형식만 사용
         if character_description:
@@ -400,11 +343,17 @@ async def set_character(request: CharacterRequest):
         logger.info(f"[CHARACTER] 완료 - session_id: {session_id}, character_name: {character_name}")
         logger.debug(f"캐릭터 설명 길이: {len(character_description)} 문자")
         
+        # 벡터 스토어가 준비되어 있는지 확인
+        ready_for_chat = session_id in vector_store_mapping
+        
         return {
             "status": "character_set",
             "session_id": session_id,
             "character_name": character_name,
-            "message": "캐릭터 정보가 성공적으로 설정되었습니다."
+            "ready_for_chat": ready_for_chat,
+            "message": "캐릭터 정보가 성공적으로 설정되었습니다." + 
+                      (" 대화할 준비가 완료되었습니다." if ready_for_chat else 
+                       " 소설 학습(train-from-s3)이 완료되면 대화할 수 있습니다.")
         }
         
     except Exception as e:
@@ -418,9 +367,29 @@ async def chat(request: ChatRequest):
     logger.debug(f"사용자 메시지: {request.message[:100]}..." if len(request.message) > 100 else f"사용자 메시지: {request.message}")
     
     session_id = request.session_id
+    
+    # 메모리에 없으면 PostgreSQL에서 로드 시도
     if session_id not in vector_store_mapping:
-        logger.warning(f"[CHAT] 세션 없음 - session_id: {session_id}")
-        raise HTTPException(status_code=404, detail="Session not found or expired")
+        logger.debug(f"메모리에 벡터 스토어 없음, PostgreSQL에서 로드 시도 - session_id: {session_id}")
+        try:
+            embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+            collection_name = f"session_{session_id}"
+            vectorstore = PGVector(
+                collection_name=collection_name,
+                connection_string=POSTGRES_CONNECTION_STRING,
+                embedding_function=embeddings,
+                use_jsonb=True
+            )
+            vector_store_mapping[session_id] = vectorstore.as_retriever(
+                search_kwargs={"k": 6}
+            )
+            logger.info(f"PostgreSQL에서 벡터 스토어 로드 완료 - collection: {collection_name}")
+        except Exception as e:
+            logger.warning(f"[CHAT] 세션 없음 - session_id: {session_id}, error: {str(e)}")
+            raise HTTPException(
+                status_code=404, 
+                detail="Session not found or expired. 먼저 소설 학습(train-from-s3)과 캐릭터 설정(character)을 완료해주세요."
+            )
 
     try:
         retriever = vector_store_mapping[session_id]
@@ -540,102 +509,6 @@ async def update_novel_content(request: UpdateContentRequest):
         logger.error(f"[UPDATE] 오류 발생 - session_id: {request.session_id}, error: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"내용 추가 중 오류 발생: {str(e)}")
-
-@app.post("/api/ai/update-file")
-async def update_novel_file(
-    file: UploadFile = File(...),
-    session_id: str = Form(...)
-):
-    """
-    파일을 통한 실시간 업데이트 (대량 추가 시 유용)
-    """
-    logger.info(f"[UPDATE-FILE] 시작 - session_id: {session_id}, filename: {file.filename}")
-    file_path = None
-    
-    try:
-        # 파일 임시 저장
-        os.makedirs("temp_ai", exist_ok=True)
-        file_path = f"temp_ai/{session_id}_update_{file.filename}"
-        logger.debug(f"파일 임시 저장 중: {file_path}")
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # 텍스트 로드
-        logger.debug("텍스트 파일 로드 중...")
-        loader = TextLoader(file_path, encoding="utf-8")
-        docs = loader.load()
-        logger.info(f"로드된 문서 수: {len(docs)}, 총 문자 수: {sum(len(doc.page_content) for doc in docs)}")
-        
-        # 텍스트 청킹
-        logger.debug("텍스트 청킹 중...")
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=150,
-            separators=["\n\n", "\n", ". ", " ", ""]
-        )
-        splits = text_splitter.split_documents(docs)
-        logger.info(f"청킹 완료 - {len(splits)}개 청크 생성")
-        
-        # 기존 벡터 스토어 로드
-        logger.debug("벡터 스토어 로드 중...")
-        embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-        collection_name = f"session_{session_id}"
-        
-        try:
-            vectorstore = PGVector(
-                collection_name=collection_name,
-                connection_string=POSTGRES_CONNECTION_STRING,
-                embedding_function=embeddings,
-                use_jsonb=True
-            )
-        except Exception as e:
-            logger.warning(f"[UPDATE-FILE] 세션 없음 - session_id: {session_id}, error: {str(e)}")
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            raise HTTPException(
-                status_code=404,
-                detail=f"세션이 존재하지 않습니다. 먼저 /api/ai/train으로 초기 학습을 진행해주세요."
-            )
-        
-        # 메타데이터 추가
-        logger.debug("메타데이터 추가 중...")
-        for doc in splits:
-            if not doc.metadata:
-                doc.metadata = {}
-            doc.metadata["source"] = file.filename
-            doc.metadata["added_at"] = str(datetime.now())
-        
-        # 벡터 스토어에 추가
-        logger.debug("벡터 스토어에 문서 추가 중...")
-        vectorstore.add_documents(splits)
-        
-        # 메모리 캐시의 retriever 업데이트
-        if session_id in vector_store_mapping:
-            vector_store_mapping[session_id] = vectorstore.as_retriever(
-                search_kwargs={"k": 6}
-            )
-            logger.debug("메모리 캐시 retriever 업데이트 완료")
-        
-        # 임시 파일 삭제
-        os.remove(file_path)
-        file_path = None
-        
-        logger.info(f"[UPDATE-FILE] 완료 - session_id: {session_id}, chunks_added: {len(splits)}")
-        return {
-            "status": "updated",
-            "session_id": session_id,
-            "chunks_added": len(splits),
-            "message": f"파일에서 {len(splits)}개 청크가 성공적으로 추가되었습니다."
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-        logger.error(f"[UPDATE-FILE] 오류 발생 - session_id: {session_id}, error: {str(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"파일 업데이트 중 오류 발생: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
