@@ -30,6 +30,7 @@ ENV/
 .env
 .env.local
 .env.*.local
+.env.production
 
 # IDE
 .vscode/
@@ -67,4 +68,3 @@ Thumbs.db
 .mypy_cache/
 .dmypy.json
 dmypy.json
-
