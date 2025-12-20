@@ -59,4 +59,4 @@ build/
 *.pem
 *.key
 secrets.json
-config/secrets.js
+config/secrets.js   

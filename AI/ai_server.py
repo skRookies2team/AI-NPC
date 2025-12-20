@@ -7,6 +7,8 @@ from fastapi import FastAPI, HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # LangChain 관련 임포트
 from langchain_community.document_loaders import TextLoader
@@ -75,6 +77,112 @@ logger.info(f"AWS_ACCESS_KEY 설정됨: {bool(AWS_ACCESS_KEY_ID)}")
 logger.info(f"AWS_SECRET_KEY 설정됨: {bool(AWS_SECRET_ACCESS_KEY)}")
 
 app = FastAPI()
+
+# PostgreSQL 세션 정보 저장/로드 함수
+def get_db_connection():
+    """PostgreSQL 연결 문자열에서 연결 객체 생성"""
+    # connection_string 형식: "postgresql://user:password@host:port/database"
+    # psycopg2는 "postgresql://" 대신 키워드 인자나 직접 파싱 필요
+    # URL 파싱
+    from urllib.parse import urlparse
+    parsed = urlparse(POSTGRES_CONNECTION_STRING)
+    return psycopg2.connect(
+        host=parsed.hostname,
+        port=parsed.port or 5432,
+        database=parsed.path[1:] if parsed.path else None,  # '/' 제거
+        user=parsed.username,
+        password=parsed.password
+    )
+
+def init_session_table():
+    """세션 정보 저장 테이블 생성"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS session_info (
+                session_id VARCHAR(255) PRIMARY KEY,
+                character_name VARCHAR(255) NOT NULL,
+                system_prompt TEXT NOT NULL,
+                character_description TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("세션 정보 테이블 초기화 완료")
+    except Exception as e:
+        logger.error(f"세션 정보 테이블 초기화 실패: {str(e)}")
+        raise
+
+def save_session_info(session_id: str, character_name: str, system_prompt: str, character_description: str = None):
+    """세션 정보를 PostgreSQL에 저장"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO session_info (session_id, character_name, system_prompt, character_description, updated_at)
+            VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+            ON CONFLICT (session_id) 
+            DO UPDATE SET 
+                character_name = EXCLUDED.character_name,
+                system_prompt = EXCLUDED.system_prompt,
+                character_description = EXCLUDED.character_description,
+                updated_at = CURRENT_TIMESTAMP
+        """, (session_id, character_name, system_prompt, character_description))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.debug(f"세션 정보 저장 완료 - session_id: {session_id}")
+    except Exception as e:
+        logger.error(f"세션 정보 저장 실패 - session_id: {session_id}, error: {str(e)}")
+        raise
+
+def load_session_info(session_id: str):
+    """PostgreSQL에서 세션 정보 로드"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT session_id, character_name, system_prompt, character_description, created_at, updated_at
+            FROM session_info
+            WHERE session_id = %s
+        """, (session_id,))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        if result:
+            logger.debug(f"세션 정보 로드 완료 - session_id: {session_id}")
+            return dict(result)
+        return None
+    except Exception as e:
+        logger.warning(f"세션 정보 로드 실패 - session_id: {session_id}, error: {str(e)}")
+        return None
+
+def list_all_sessions():
+    """PostgreSQL에서 모든 세션 목록 조회"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT session_id, character_name, character_description, created_at, updated_at
+            FROM session_info
+            ORDER BY updated_at DESC
+        """)
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+        sessions = [dict(row) for row in results]
+        logger.debug(f"세션 목록 조회 완료 - 총 {len(sessions)}개 세션")
+        return sessions
+    except Exception as e:
+        logger.error(f"세션 목록 조회 실패 - error: {str(e)}")
+        return []
+
+# 서버 시작 시 테이블 초기화
+init_session_table()
 
 # 요청/응답 로깅 미들웨어
 class LoggingMiddleware(BaseHTTPMiddleware):
@@ -231,7 +339,7 @@ async def train_novel_from_s3(request: TrainFromS3Request):
         )
         
         # 페르소나 프롬프트 설정
-        system_prompts[request.session_id] = f"""
+        system_prompt = f"""
         당신은 소설 속 인물 '{request.character_name}'입니다.
         
         **중요 규칙:**
@@ -244,7 +352,16 @@ async def train_novel_from_s3(request: TrainFromS3Request):
         [Context]:
         {{context}}
         """
-        logger.debug(f"시스템 프롬프트 설정 완료 - character_name: {request.character_name}")
+        system_prompts[request.session_id] = system_prompt
+        
+        # PostgreSQL에 세션 정보 저장
+        save_session_info(
+            session_id=request.session_id,
+            character_name=request.character_name,
+            system_prompt=system_prompt,
+            character_description=None
+        )
+        logger.debug(f"시스템 프롬프트 설정 및 저장 완료 - character_name: {request.character_name}")
         
         # 임시 파일 삭제
         if os.path.exists(file_path):
@@ -304,6 +421,15 @@ async def set_character(request: CharacterRequest):
                 # 벡터 스토어가 없어도 캐릭터 정보는 저장하도록 함
                 # (나중에 소설 학습하면 대화 가능)
         
+        # 기존 시스템 프롬프트 로드 (메모리에 없으면 PostgreSQL에서 로드)
+        # 캐릭터 설명만 업데이트하는 경우 기존 프롬프트를 사용
+        if session_id not in system_prompts:
+            session_info = load_session_info(session_id)
+            if session_info and not character_description:
+                # 기존 프롬프트가 있고 새로운 설명이 없으면 기존 것 사용
+                system_prompts[session_id] = session_info['system_prompt']
+                logger.debug(f"기존 시스템 프롬프트 로드 완료 - session_id: {session_id}")
+        
         # 캐릭터 설명이 있으면 추가, 없으면 기본 형식만 사용
         if character_description:
             system_prompt = f"""
@@ -338,8 +464,17 @@ async def set_character(request: CharacterRequest):
         {{context}}
         """
         
-        # 시스템 프롬프트 저장
+        # 시스템 프롬프트 저장 (메모리 + PostgreSQL)
         system_prompts[session_id] = system_prompt
+        
+        # PostgreSQL에 세션 정보 저장
+        save_session_info(
+            session_id=session_id,
+            character_name=character_name,
+            system_prompt=system_prompt,
+            character_description=character_description
+        )
+        
         logger.info(f"[CHARACTER] 완료 - session_id: {session_id}, character_name: {character_name}")
         logger.debug(f"캐릭터 설명 길이: {len(character_description)} 문자")
         
@@ -360,6 +495,56 @@ async def set_character(request: CharacterRequest):
         logger.error(f"[CHARACTER] 오류 발생 - session_id: {request.session_id}, error: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"캐릭터 정보 설정 중 오류 발생: {str(e)}")
+
+@app.get("/api/ai/sessions")
+async def list_sessions():
+    """
+    모든 세션(게임) 목록 조회
+    사용자가 만든 모든 소설 게임 목록을 반환
+    """
+    logger.info("[LIST-SESSIONS] 세션 목록 조회 요청")
+    try:
+        sessions = list_all_sessions()
+        return {
+            "status": "success",
+            "sessions": sessions,
+            "count": len(sessions)
+        }
+    except Exception as e:
+        logger.error(f"[LIST-SESSIONS] 오류 발생 - error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"세션 목록 조회 중 오류 발생: {str(e)}")
+
+@app.get("/api/ai/session/{session_id}")
+async def get_session_info(session_id: str):
+    """
+    특정 세션의 상세 정보 조회
+    게임을 시작하기 전에 세션 정보를 확인할 수 있음
+    """
+    logger.info(f"[GET-SESSION] 세션 정보 조회 요청 - session_id: {session_id}")
+    try:
+        session_info = load_session_info(session_id)
+        if not session_info:
+            raise HTTPException(status_code=404, detail="Session not found")
+        
+        # system_prompt는 제외하고 반환 (너무 길 수 있음)
+        response = {
+            "session_id": session_info["session_id"],
+            "character_name": session_info["character_name"],
+            "character_description": session_info.get("character_description"),
+            "created_at": str(session_info.get("created_at")),
+            "updated_at": str(session_info.get("updated_at"))
+        }
+        return {
+            "status": "success",
+            "session": response
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[GET-SESSION] 오류 발생 - session_id: {session_id}, error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"세션 정보 조회 중 오류 발생: {str(e)}")
 
 @app.post("/api/ai/chat")
 async def chat(request: ChatRequest):
@@ -390,6 +575,13 @@ async def chat(request: ChatRequest):
                 status_code=404, 
                 detail="Session not found or expired. 먼저 소설 학습(train-from-s3)과 캐릭터 설정(character)을 완료해주세요."
             )
+    
+    # 시스템 프롬프트 로드 (메모리에 없으면 PostgreSQL에서 로드)
+    if session_id not in system_prompts:
+        session_info = load_session_info(session_id)
+        if session_info:
+            system_prompts[session_id] = session_info['system_prompt']
+            logger.info(f"PostgreSQL에서 시스템 프롬프트 로드 완료 - session_id: {session_id}")
 
     try:
         retriever = vector_store_mapping[session_id]
