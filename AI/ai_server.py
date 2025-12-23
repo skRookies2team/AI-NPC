@@ -2,6 +2,7 @@ import os
 import shutil
 import logging
 import traceback
+import re
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -338,9 +339,14 @@ async def train_novel_from_s3(request: TrainFromS3Request):
             search_kwargs={"k": 6}
         )
         
-        # 페르소나 프롬프트 설정
+        # train-from-s3에서는 소설만 학습하고, 캐릭터 이름은 나중에 /api/ai/character에서 설정
+        # 여기서는 기본 프롬프트만 생성 (캐릭터 이름 없이)
+        # character_name은 나중에 설정될 때까지 기본값 사용
+        character_name = request.character_name.strip() if request.character_name else "캐릭터"
+        
+        # 기본 프롬프트 설정 (캐릭터 이름은 나중에 /api/ai/character에서 설정됨)
         system_prompt = f"""
-        당신은 소설 속 인물 '{request.character_name}'입니다.
+        당신은 소설 속 인물입니다.
         
         **중요 규칙:**
         1. 아래 [Context]에 있는 소설 내용만을 바탕으로 답변하세요.
@@ -352,16 +358,19 @@ async def train_novel_from_s3(request: TrainFromS3Request):
         [Context]:
         {{context}}
         """
+        
+        # 메모리에 임시 저장 (나중에 /api/ai/character에서 업데이트됨)
         system_prompts[request.session_id] = system_prompt
         
-        # PostgreSQL에 세션 정보 저장
+        # PostgreSQL에 세션 정보 저장 (character_name은 임시로 저장, 나중에 업데이트됨)
         save_session_info(
             session_id=request.session_id,
-            character_name=request.character_name,
+            character_name=character_name,  # 임시 값 (나중에 /api/ai/character에서 업데이트)
             system_prompt=system_prompt,
             character_description=None
         )
-        logger.debug(f"시스템 프롬프트 설정 및 저장 완료 - character_name: {request.character_name}")
+        logger.info(f"[TRAIN-FROM-S3] 소설 학습 완료 - session_id: {request.session_id}")
+        logger.info(f"[TRAIN-FROM-S3] 캐릭터 이름은 /api/ai/character 엔드포인트에서 설정해주세요.")
         
         # 임시 파일 삭제
         if os.path.exists(file_path):
@@ -551,11 +560,33 @@ async def chat(request: ChatRequest):
     logger.info(f"[CHAT] 시작 - session_id: {request.session_id}")
     logger.debug(f"사용자 메시지: {request.message[:100]}..." if len(request.message) > 100 else f"사용자 메시지: {request.message}")
     
+    # session_id에서 캐릭터 이름 부분 제거 (예: story_6bfa4631_잭 -> story_6bfa4631)
+    # 프론트엔드에서 캐릭터 이름을 붙여서 보내는 경우를 처리
     session_id = request.session_id
+    if '_' in session_id and session_id.startswith('story_'):
+        # story_로 시작하고 _가 있으면, 마지막 _ 이후가 캐릭터 이름일 수 있음
+        # 하지만 벡터 스토어는 캐릭터 이름 포함해서 저장될 수도 있으므로 둘 다 시도
+        parts = session_id.split('_')
+        if len(parts) >= 3:
+            # 원본 session_id (캐릭터 이름 제거)
+            base_session_id = '_'.join(parts[:2])  # story_6bfa4631
+            logger.debug(f"원본 session_id 추출 시도: {base_session_id} (원본: {session_id})")
+            
+            # 먼저 원본 session_id로 시도
+            test_info = load_session_info(base_session_id)
+            if test_info:
+                logger.info(f"원본 session_id로 세션 정보 찾음: {base_session_id}")
+                session_id = base_session_id
+            # 원본으로 못 찾으면 원래 session_id 그대로 사용 (벡터 스토어는 캐릭터 이름 포함해서 저장되었을 수 있음)
     
     # 메모리에 없으면 PostgreSQL에서 로드 시도
+    # 벡터 스토어도 원본 session_id로 찾기 시도
+    vectorstore_loaded = False
+    base_session_id = None
     if session_id not in vector_store_mapping:
         logger.debug(f"메모리에 벡터 스토어 없음, PostgreSQL에서 로드 시도 - session_id: {session_id}")
+        
+        # 먼저 현재 session_id로 시도
         try:
             embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
             collection_name = f"session_{session_id}"
@@ -565,12 +596,45 @@ async def chat(request: ChatRequest):
                 embedding_function=embeddings,
                 use_jsonb=True
             )
-            vector_store_mapping[session_id] = vectorstore.as_retriever(
-                search_kwargs={"k": 6}
-            )
-            logger.info(f"PostgreSQL에서 벡터 스토어 로드 완료 - collection: {collection_name}")
+            # 벡터 스토어가 실제로 데이터를 가지고 있는지 확인
+            test_docs = vectorstore.similarity_search("test", k=1)
+            if len(test_docs) > 0:
+                vector_store_mapping[session_id] = vectorstore.as_retriever(
+                    search_kwargs={"k": 6}
+                )
+                logger.info(f"PostgreSQL에서 벡터 스토어 로드 완료 - collection: {collection_name}")
+                vectorstore_loaded = True
         except Exception as e:
-            logger.warning(f"[CHAT] 세션 없음 - session_id: {session_id}, error: {str(e)}")
+            logger.debug(f"현재 session_id로 벡터 스토어 로드 실패: {str(e)}")
+        
+        # 실패하면 원본 session_id로 시도 (캐릭터 이름 제거)
+        if not vectorstore_loaded and '_' in request.session_id and request.session_id.startswith('story_'):
+            parts = request.session_id.split('_')
+            if len(parts) >= 3:
+                base_session_id = '_'.join(parts[:2])  # story_6bfa4631
+                try:
+                    logger.debug(f"원본 session_id로 벡터 스토어 로드 시도: {base_session_id}")
+                    collection_name = f"session_{base_session_id}"
+                    vectorstore = PGVector(
+                        collection_name=collection_name,
+                        connection_string=POSTGRES_CONNECTION_STRING,
+                        embedding_function=embeddings,
+                        use_jsonb=True
+                    )
+                    test_docs = vectorstore.similarity_search("test", k=1)
+                    if len(test_docs) > 0:
+                        vector_store_mapping[session_id] = vectorstore.as_retriever(
+                            search_kwargs={"k": 6}
+                        )
+                        logger.info(f"원본 session_id로 벡터 스토어 로드 완료 - collection: {collection_name}")
+                        vectorstore_loaded = True
+                        # session_id도 원본으로 업데이트
+                        session_id = base_session_id
+                except Exception as e:
+                    logger.debug(f"원본 session_id로도 벡터 스토어 로드 실패: {str(e)}")
+        
+        if not vectorstore_loaded:
+            logger.warning(f"[CHAT] 세션 없음 - session_id: {request.session_id}, 원본 시도: {base_session_id if base_session_id else 'N/A'}")
             raise HTTPException(
                 status_code=404, 
                 detail="Session not found or expired. 먼저 소설 학습(train-from-s3)과 캐릭터 설정(character)을 완료해주세요."
@@ -582,6 +646,10 @@ async def chat(request: ChatRequest):
         if session_info:
             system_prompts[session_id] = session_info['system_prompt']
             logger.info(f"PostgreSQL에서 시스템 프롬프트 로드 완료 - session_id: {session_id}")
+            logger.debug(f"로드된 프롬프트에 context 변수 있는지: {'{context}' in session_info['system_prompt']}")
+        else:
+            logger.warning(f"⚠️ 세션 정보를 찾을 수 없습니다 - session_id: {session_id}")
+            logger.warning("기본 프롬프트를 사용하지만, context가 없어 스토리 내용이 반영되지 않을 수 있습니다.")
 
     try:
         retriever = vector_store_mapping[session_id]
@@ -596,9 +664,30 @@ async def chat(request: ChatRequest):
         llm = ChatOpenAI(model="gpt-4o", temperature=0.7, openai_api_key=OPENAI_API_KEY)
 
         def format_docs(docs):
-            return "\n\n".join(doc.page_content for doc in docs)
+            formatted = "\n\n".join(doc.page_content for doc in docs)
+            logger.debug(f"검색된 문서 수: {len(docs)}, 컨텍스트 길이: {len(formatted)} 문자")
+            if docs:
+                logger.debug(f"첫 번째 문서 미리보기: {docs[0].page_content[:200]}...")
+            return formatted
 
         logger.debug("RAG 체인 실행 중...")
+        
+        # 디버깅: 프롬프트 템플릿 확인
+        logger.info(f"[CHAT] 사용할 시스템 프롬프트 (처음 300자): {template[:300]}...")
+        logger.info(f"[CHAT] 프롬프트에 context 변수가 있는지: {'{context}' in template}")
+        
+        # 디버깅: 벡터 검색 테스트
+        try:
+            test_docs = retriever.invoke(request.message)
+            logger.info(f"[CHAT] 벡터 검색 성공 - 검색된 문서 수: {len(test_docs)}")
+            if len(test_docs) == 0:
+                logger.warning("⚠️ [CHAT] 벡터 검색 결과가 비어있습니다! 소설 학습이 제대로 되지 않았을 수 있습니다.")
+            else:
+                logger.info(f"[CHAT] 첫 번째 검색 결과 미리보기: {test_docs[0].page_content[:200]}...")
+        except Exception as e:
+            logger.error(f"[CHAT] 벡터 검색 테스트 실패: {str(e)}")
+            logger.error(f"[CHAT] Traceback: {traceback.format_exc()}")
+        
         rag_chain = (
             {"context": retriever | format_docs, "question": RunnablePassthrough()}
             | prompt
