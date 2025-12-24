@@ -5,7 +5,11 @@ import traceback
 import re
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+from typing import Optional
 from pydantic import BaseModel
 from dotenv import load_dotenv
 import psycopg2
@@ -79,6 +83,43 @@ logger.info(f"AWS_SECRET_KEY 설정됨: {bool(AWS_SECRET_ACCESS_KEY)}")
 
 app = FastAPI()
 
+# 요청 검증 오류 핸들러 추가
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: StarletteRequest, exc: RequestValidationError):
+    """요청 검증 오류 상세 로깅"""
+    errors = exc.errors()
+    error_details = []
+    for error in errors:
+        field = " -> ".join(str(loc) for loc in error["loc"])
+        error_details.append({
+            "field": field,
+            "message": error["msg"],
+            "type": error["type"],
+            "input": error.get("input")
+        })
+    
+    # 요청 본문 읽기 시도
+    body_str = "N/A"
+    try:
+        body_bytes = await request.body()
+        if body_bytes:
+            body_str = body_bytes.decode('utf-8')[:500]  # 처음 500자만
+    except Exception as e:
+        body_str = f"요청 본문 읽기 실패: {str(e)}"
+    
+    logger.error(f"[VALIDATION ERROR] {request.method} {request.url.path}")
+    logger.error(f"[VALIDATION ERROR] 오류 상세: {error_details}")
+    logger.error(f"[VALIDATION ERROR] 요청 본문: {body_str}")
+    logger.error(f"[VALIDATION ERROR] 요청 헤더: {dict(request.headers)}")
+    
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": error_details,
+            "message": "요청 형식이 올바르지 않습니다."
+        }
+    )
+
 # PostgreSQL 세션 정보 저장/로드 함수
 def get_db_connection():
     """PostgreSQL 연결 문자열에서 연결 객체 생성"""
@@ -96,20 +137,60 @@ def get_db_connection():
     )
 
 def init_session_table():
-    """세션 정보 저장 테이블 생성"""
+    """세션 정보 저장 테이블 생성 (한 세션에 여러 캐릭터 지원)"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
+        
+        # 기존 테이블이 있는지 확인
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS session_info (
-                session_id VARCHAR(255) PRIMARY KEY,
-                character_name VARCHAR(255) NOT NULL,
-                system_prompt TEXT NOT NULL,
-                character_description TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'session_info'
+            );
         """)
+        table_exists = cur.fetchone()[0]
+        
+        if table_exists:
+            # 기존 테이블이 있으면 PRIMARY KEY 변경 시도
+            try:
+                # 기존 PRIMARY KEY 제약조건 확인 및 제거
+                cur.execute("""
+                    SELECT constraint_name 
+                    FROM information_schema.table_constraints 
+                    WHERE table_name = 'session_info' 
+                    AND constraint_type = 'PRIMARY KEY';
+                """)
+                pk_constraint = cur.fetchone()
+                if pk_constraint:
+                    cur.execute(f"ALTER TABLE session_info DROP CONSTRAINT {pk_constraint[0]};")
+                    logger.info(f"기존 PRIMARY KEY 제약조건 제거: {pk_constraint[0]}")
+                
+                # 복합 PRIMARY KEY 추가
+                cur.execute("""
+                    ALTER TABLE session_info 
+                    ADD PRIMARY KEY (session_id, character_name);
+                """)
+                logger.info("기존 테이블에 복합 PRIMARY KEY 추가 완료")
+            except Exception as e:
+                # 이미 복합 키가 있거나 다른 이유로 실패할 수 있음
+                logger.debug(f"PRIMARY KEY 변경 시도 중 (이미 변경되었을 수 있음): {str(e)}")
+                conn.rollback()
+        else:
+            # 새 테이블 생성
+            cur.execute("""
+                CREATE TABLE session_info (
+                    session_id VARCHAR(255) NOT NULL,
+                    character_name VARCHAR(255) NOT NULL,
+                    system_prompt TEXT NOT NULL,
+                    character_description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (session_id, character_name)
+                )
+            """)
+            logger.info("새 세션 정보 테이블 생성 완료 (복합 PRIMARY KEY)")
+        
         conn.commit()
         cur.close()
         conn.close()
@@ -119,16 +200,15 @@ def init_session_table():
         raise
 
 def save_session_info(session_id: str, character_name: str, system_prompt: str, character_description: str = None):
-    """세션 정보를 PostgreSQL에 저장"""
+    """세션 정보를 PostgreSQL에 저장 (한 세션에 여러 캐릭터 지원)"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO session_info (session_id, character_name, system_prompt, character_description, updated_at)
             VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (session_id) 
+            ON CONFLICT (session_id, character_name) 
             DO UPDATE SET 
-                character_name = EXCLUDED.character_name,
                 system_prompt = EXCLUDED.system_prompt,
                 character_description = EXCLUDED.character_description,
                 updated_at = CURRENT_TIMESTAMP
@@ -136,13 +216,53 @@ def save_session_info(session_id: str, character_name: str, system_prompt: str, 
         conn.commit()
         cur.close()
         conn.close()
-        logger.debug(f"세션 정보 저장 완료 - session_id: {session_id}")
+        logger.debug(f"세션 정보 저장 완료 - session_id: {session_id}, character_name: {character_name}")
     except Exception as e:
-        logger.error(f"세션 정보 저장 실패 - session_id: {session_id}, error: {str(e)}")
+        logger.error(f"세션 정보 저장 실패 - session_id: {session_id}, character_name: {character_name}, error: {str(e)}")
         raise
 
-def load_session_info(session_id: str):
-    """PostgreSQL에서 세션 정보 로드"""
+def load_session_info(session_id: str, character_name: str = None):
+    """PostgreSQL에서 세션 정보 로드 (특정 캐릭터 또는 세션의 모든 캐릭터)"""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        if character_name:
+            # 특정 캐릭터만 로드
+            cur.execute("""
+                SELECT session_id, character_name, system_prompt, character_description, created_at, updated_at
+                FROM session_info
+                WHERE session_id = %s AND character_name = %s
+            """, (session_id, character_name))
+            result = cur.fetchone()
+            cur.close()
+            conn.close()
+            if result:
+                logger.debug(f"세션 정보 로드 완료 - session_id: {session_id}, character_name: {character_name}")
+                return dict(result)
+            return None
+        else:
+            # 세션의 모든 캐릭터 로드 (첫 번째 캐릭터 반환 - 하위 호환성)
+            cur.execute("""
+                SELECT session_id, character_name, system_prompt, character_description, created_at, updated_at
+                FROM session_info
+                WHERE session_id = %s
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """, (session_id,))
+            result = cur.fetchone()
+            cur.close()
+            conn.close()
+            if result:
+                logger.debug(f"세션 정보 로드 완료 - session_id: {session_id} (첫 번째 캐릭터)")
+                return dict(result)
+            return None
+    except Exception as e:
+        logger.warning(f"세션 정보 로드 실패 - session_id: {session_id}, character_name: {character_name}, error: {str(e)}")
+        return None
+
+def load_all_characters_for_session(session_id: str):
+    """세션의 모든 캐릭터 정보 로드"""
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -150,17 +270,17 @@ def load_session_info(session_id: str):
             SELECT session_id, character_name, system_prompt, character_description, created_at, updated_at
             FROM session_info
             WHERE session_id = %s
+            ORDER BY updated_at DESC
         """, (session_id,))
-        result = cur.fetchone()
+        results = cur.fetchall()
         cur.close()
         conn.close()
-        if result:
-            logger.debug(f"세션 정보 로드 완료 - session_id: {session_id}")
-            return dict(result)
-        return None
+        characters = [dict(row) for row in results]
+        logger.debug(f"세션의 모든 캐릭터 로드 완료 - session_id: {session_id}, 캐릭터 수: {len(characters)}")
+        return characters
     except Exception as e:
-        logger.warning(f"세션 정보 로드 실패 - session_id: {session_id}, error: {str(e)}")
-        return None
+        logger.warning(f"세션의 모든 캐릭터 로드 실패 - session_id: {session_id}, error: {str(e)}")
+        return []
 
 def list_all_sessions():
     """PostgreSQL에서 모든 세션 목록 조회"""
@@ -223,6 +343,7 @@ system_prompts = {}
 
 class ChatRequest(BaseModel):
     session_id: str
+    character_name: str  # 대화할 NPC 캐릭터 이름 (필수)
     message: str
 
 class UpdateContentRequest(BaseModel):
@@ -359,10 +480,12 @@ async def train_novel_from_s3(request: TrainFromS3Request):
         {{context}}
         """
         
-        # 메모리에 임시 저장 (나중에 /api/ai/character에서 업데이트됨)
-        system_prompts[request.session_id] = system_prompt
+        # train-from-s3에서는 임시 프롬프트만 저장 (나중에 /api/ai/character에서 제대로 설정됨)
+        # 새로운 키 형식 사용 (하지만 character_name이 임시 값이므로 /api/ai/character에서 덮어쓰게 됨)
+        prompt_key = f"{request.session_id}:{character_name}"
+        system_prompts[prompt_key] = system_prompt
         
-        # PostgreSQL에 세션 정보 저장 (character_name은 임시로 저장, 나중에 업데이트됨)
+        # PostgreSQL에 세션 정보 저장 (character_name은 임시로 저장, 나중에 /api/ai/character에서 업데이트됨)
         save_session_info(
             session_id=request.session_id,
             character_name=character_name,  # 임시 값 (나중에 /api/ai/character에서 업데이트)
@@ -388,6 +511,102 @@ async def train_novel_from_s3(request: TrainFromS3Request):
         raise
     except Exception as e:
         logger.error(f"[TRAIN-FROM-S3] 오류 발생 - session_id: {request.session_id}, error: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        raise HTTPException(status_code=500, detail=f"학습 중 오류 발생: {str(e)}")
+
+class TrainTextRequest(BaseModel):
+    """테스트용: 텍스트 직접 전송하여 학습"""
+    session_id: str
+    content: str  # 소설 텍스트 내용
+    character_name: str = ""  # 캐릭터 이름 (선택적, 나중에 /api/ai/character에서 설정 가능)
+
+@app.post("/api/ai/train-text")
+async def train_novel_from_text(request: TrainTextRequest):
+    """
+    테스트용: 텍스트를 직접 받아서 학습
+    실제 운영에서는 /api/ai/train-from-s3를 사용하세요
+    """
+    logger.info(f"[TRAIN-TEXT] 시작 - session_id: {request.session_id}")
+    file_path = None
+    
+    try:
+        # 임시 파일로 저장
+        os.makedirs("temp_ai", exist_ok=True)
+        file_path = f"temp_ai/{request.session_id}_novel.txt"
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(request.content)
+        logger.info(f"임시 파일 저장 완료 - {file_path}")
+        
+        # TextLoader로 로드
+        loader = TextLoader(file_path, encoding="utf-8")
+        docs = loader.load()
+        logger.info(f"로드된 문서 수: {len(docs)}, 총 문자 수: {sum(len(doc.page_content) for doc in docs)}")
+        
+        # 텍스트 청킹
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=800,
+            chunk_overlap=150,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+        splits = text_splitter.split_documents(docs)
+        logger.info(f"청킹 완료 - 총 {len(splits)}개 청크 생성")
+        
+        # 임베딩 및 벡터 저장
+        embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        collection_name = f"session_{request.session_id}"
+        vectorstore = PGVector.from_documents(
+            documents=splits,
+            embedding=embeddings,
+            collection_name=collection_name,
+            connection_string=POSTGRES_CONNECTION_STRING,
+            use_jsonb=True
+        )
+        logger.info(f"벡터 저장소 생성 완료 - collection: {collection_name}")
+        
+        # Retriever 설정
+        vector_store_mapping[request.session_id] = vectorstore.as_retriever(
+            search_kwargs={"k": 6}
+        )
+        
+        # 캐릭터 이름 처리
+        character_name = request.character_name.strip() if request.character_name else "캐릭터"
+        system_prompt = f"""
+        당신은 소설 속 인물입니다.
+        
+        **중요 규칙:**
+        1. 아래 [Context]에 있는 소설 내용만을 바탕으로 답변하세요.
+        2. [Context]에 없는 정보는 절대 만들어내지 마세요.
+        3. [Context]에 답변할 수 있는 정보가 없으면 "소설 내용에 그런 정보는 나오지 않습니다" 또는 "모르겠습니다"라고 솔직하게 말하세요.
+        4. 컨텍스트 밖의 일반 지식이나 추측을 사용하지 마세요.
+        5. 소설에 나오는 인물, 장소, 사건의 이름과 표현을 정확히 사용하세요.
+        
+        [Context]:
+        {{context}}
+        """
+        
+        # train-text는 소설만 학습 (character_name은 나중에 /api/ai/character에서 설정)
+        # 여기서는 벡터 스토어만 생성하고, 프롬프트는 나중에 /api/ai/character에서 설정됨
+        # character_name이 제공되어도 저장하지 않음 (나중에 character 엔드포인트에서 제대로 설정)
+        logger.info(f"[TRAIN-TEXT] 소설 학습 완료 - session_id: {request.session_id}")
+        logger.info(f"[TRAIN-TEXT] 캐릭터는 /api/ai/character 엔드포인트에서 설정하세요.")
+        
+        # 임시 파일 삭제
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        
+        return {
+            "status": "trained",
+            "session_id": request.session_id,
+            "chunks_created": len(splits)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[TRAIN-TEXT] 오류 발생 - session_id: {request.session_id}, error: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
@@ -432,49 +651,65 @@ async def set_character(request: CharacterRequest):
         
         # 기존 시스템 프롬프트 로드 (메모리에 없으면 PostgreSQL에서 로드)
         # 캐릭터 설명만 업데이트하는 경우 기존 프롬프트를 사용
-        if session_id not in system_prompts:
-            session_info = load_session_info(session_id)
+        prompt_key = f"{session_id}:{character_name}"
+        if prompt_key not in system_prompts:
+            session_info = load_session_info(session_id, character_name)
             if session_info and not character_description:
                 # 기존 프롬프트가 있고 새로운 설명이 없으면 기존 것 사용
-                system_prompts[session_id] = session_info['system_prompt']
-                logger.debug(f"기존 시스템 프롬프트 로드 완료 - session_id: {session_id}")
+                system_prompts[prompt_key] = session_info['system_prompt']
+                logger.debug(f"기존 시스템 프롬프트 로드 완료 - session_id: {session_id}, character_name: {character_name}")
         
         # 캐릭터 설명이 있으면 추가, 없으면 기본 형식만 사용
         if character_description:
-            system_prompt = f"""
-        당신은 소설 속 인물 '{character_name}'입니다.
-        
-        **캐릭터 정보:**
-        {character_description}
-        
-        **중요 규칙:**
-        1. 아래 [Context]에 있는 소설 내용만을 바탕으로 답변하세요.
-        2. [Context]에 없는 정보는 절대 만들어내지 마세요.
-        3. [Context]에 답변할 수 있는 정보가 없으면 "소설 내용에 그런 정보는 나오지 않습니다" 또는 "모르겠습니다"라고 솔직하게 말하세요.
-        4. 컨텍스트 밖의 일반 지식이나 추측을 사용하지 마세요.
-        5. 소설에 나오는 인물, 장소, 사건의 이름과 표현을 정확히 사용하세요.
-        6. 위에 명시된 캐릭터 정보와 소설 내용을 함께 고려하여 일관된 캐릭터로 답변하세요.
-        
-        [Context]:
-        {{context}}
-        """
+            system_prompt = f"""당신은 소설 속 인물 '{character_name}'입니다. 당신은 이제 게임 속 NPC로서 플레이어와 직접 대화하고 있습니다.
+
+**캐릭터 정보:**
+{character_description}
+
+**대화 규칙 (매우 중요):**
+1. 아래 [Context]에 있는 소설 내용만을 바탕으로 말하세요. 설명하듯이 말하지 말고, 그 캐릭터로서 직접 말하세요.
+2. 절대 3인칭으로 설명하지 마세요. 예를 들어 "{character_name}는..."이 아니라 "나는..."이라고 말하세요.
+3. [Context]에 없는 정보는 모르는 척하거나 "그건 잘 모르겠는데요" 같은 자연스러운 표현을 사용하세요.
+4. 소설에 나오는 인물, 장소, 사건의 이름과 표현을 정확히 사용하세요.
+5. 캐릭터로서 자연스럽고 생동감 있게 대화하세요. 설명하는 AI가 아니라 살아있는 캐릭터처럼 말하세요.
+6. "입니다", "합니다" 같은 딱딱한 존댓말보다는 캐릭터의 성격에 맞는 말투를 사용하세요.
+
+**금지 사항:**
+- "{character_name}는 ~입니다" 같은 설명 문구 사용 금지
+- "소설 내용에 ~가 나옵니다" 같은 메타적인 표현 금지
+- 3인칭 설명 금지
+
+**예시 (잘못된 답변):**
+"밸더자는 로미오의 하인으로, 로미오에게 베로나에서의 소식을 전하는 역할을 합니다."
+
+**예시 (올바른 답변):**
+"저는 로미오님의 하인 밸더자입니다. 베로나에서 나쁜 소식을 가져왔습니다. 죄송합니다만, 줄리엣 아가씨께서..."
+
+[Context]:
+{{context}}"""
         else:
-            system_prompt = f"""
-        당신은 소설 속 인물 '{character_name}'입니다.
-        
-        **중요 규칙:**
-        1. 아래 [Context]에 있는 소설 내용만을 바탕으로 답변하세요.
-        2. [Context]에 없는 정보는 절대 만들어내지 마세요.
-        3. [Context]에 답변할 수 있는 정보가 없으면 "소설 내용에 그런 정보는 나오지 않습니다" 또는 "모르겠습니다"라고 솔직하게 말하세요.
-        4. 컨텍스트 밖의 일반 지식이나 추측을 사용하지 마세요.
-        5. 소설에 나오는 인물, 장소, 사건의 이름과 표현을 정확히 사용하세요.
-        
-        [Context]:
-        {{context}}
-        """
+            system_prompt = f"""당신은 소설 속 인물 '{character_name}'입니다. 당신은 이제 게임 속 NPC로서 플레이어와 직접 대화하고 있습니다.
+
+**대화 규칙 (매우 중요):**
+1. 아래 [Context]에 있는 소설 내용만을 바탕으로 말하세요. 설명하듯이 말하지 말고, 그 캐릭터로서 직접 말하세요.
+2. 절대 3인칭으로 설명하지 마세요. 예를 들어 "{character_name}는..."이 아니라 "나는..."이라고 말하세요.
+3. [Context]에 없는 정보는 모르는 척하거나 "그건 잘 모르겠는데요" 같은 자연스러운 표현을 사용하세요.
+4. 소설에 나오는 인물, 장소, 사건의 이름과 표현을 정확히 사용하세요.
+5. 캐릭터로서 자연스럽고 생동감 있게 대화하세요. 설명하는 AI가 아니라 살아있는 캐릭터처럼 말하세요.
+6. "입니다", "합니다" 같은 딱딱한 존댓말보다는 캐릭터의 성격에 맞는 말투를 사용하세요.
+
+**금지 사항:**
+- "{character_name}는 ~입니다" 같은 설명 문구 사용 금지
+- "소설 내용에 ~가 나옵니다" 같은 메타적인 표현 금지
+- 3인칭 설명 금지
+
+[Context]:
+{{context}}"""
         
         # 시스템 프롬프트 저장 (메모리 + PostgreSQL)
-        system_prompts[session_id] = system_prompt
+        # 키를 session_id:character_name 형태로 저장 (한 세션에 여러 캐릭터 지원)
+        prompt_key = f"{session_id}:{character_name}"
+        system_prompts[prompt_key] = system_prompt
         
         # PostgreSQL에 세션 정보 저장
         save_session_info(
@@ -527,26 +762,30 @@ async def list_sessions():
 @app.get("/api/ai/session/{session_id}")
 async def get_session_info(session_id: str):
     """
-    특정 세션의 상세 정보 조회
+    특정 세션의 상세 정보 조회 (모든 캐릭터 포함)
     게임을 시작하기 전에 세션 정보를 확인할 수 있음
     """
     logger.info(f"[GET-SESSION] 세션 정보 조회 요청 - session_id: {session_id}")
     try:
-        session_info = load_session_info(session_id)
-        if not session_info:
+        characters = load_all_characters_for_session(session_id)
+        if not characters:
             raise HTTPException(status_code=404, detail="Session not found")
         
         # system_prompt는 제외하고 반환 (너무 길 수 있음)
-        response = {
-            "session_id": session_info["session_id"],
-            "character_name": session_info["character_name"],
-            "character_description": session_info.get("character_description"),
-            "created_at": str(session_info.get("created_at")),
-            "updated_at": str(session_info.get("updated_at"))
-        }
+        characters_info = []
+        for char in characters:
+            characters_info.append({
+                "character_name": char["character_name"],
+                "character_description": char.get("character_description"),
+                "created_at": str(char.get("created_at")),
+                "updated_at": str(char.get("updated_at"))
+            })
+        
         return {
             "status": "success",
-            "session": response
+            "session_id": session_id,
+            "characters": characters_info,
+            "character_count": len(characters_info)
         }
     except HTTPException:
         raise
@@ -557,27 +796,22 @@ async def get_session_info(session_id: str):
 
 @app.post("/api/ai/chat")
 async def chat(request: ChatRequest):
-    logger.info(f"[CHAT] 시작 - session_id: {request.session_id}")
+    logger.info(f"[CHAT] 시작 - session_id: {request.session_id}, character_name: {request.character_name}")
     logger.debug(f"사용자 메시지: {request.message[:100]}..." if len(request.message) > 100 else f"사용자 메시지: {request.message}")
     
-    # session_id에서 캐릭터 이름 부분 제거 (예: story_6bfa4631_잭 -> story_6bfa4631)
-    # 프론트엔드에서 캐릭터 이름을 붙여서 보내는 경우를 처리
     session_id = request.session_id
-    if '_' in session_id and session_id.startswith('story_'):
-        # story_로 시작하고 _가 있으면, 마지막 _ 이후가 캐릭터 이름일 수 있음
-        # 하지만 벡터 스토어는 캐릭터 이름 포함해서 저장될 수도 있으므로 둘 다 시도
+    character_name = request.character_name
+    
+    # session_id에서 캐릭터 이름 부분 제거 (예: story_6bfa4631_잭 -> story_6bfa4631)
+    # 프론트엔드에서 캐릭터 이름을 붙여서 보내는 경우를 처리 (하위 호환성)
+    if '_' in session_id and session_id.startswith('story_') and not character_name:
         parts = session_id.split('_')
         if len(parts) >= 3:
             # 원본 session_id (캐릭터 이름 제거)
             base_session_id = '_'.join(parts[:2])  # story_6bfa4631
-            logger.debug(f"원본 session_id 추출 시도: {base_session_id} (원본: {session_id})")
-            
-            # 먼저 원본 session_id로 시도
-            test_info = load_session_info(base_session_id)
-            if test_info:
-                logger.info(f"원본 session_id로 세션 정보 찾음: {base_session_id}")
-                session_id = base_session_id
-            # 원본으로 못 찾으면 원래 session_id 그대로 사용 (벡터 스토어는 캐릭터 이름 포함해서 저장되었을 수 있음)
+            character_name = '_'.join(parts[2:])  # 마지막 부분을 character_name으로 추출
+            logger.debug(f"session_id에서 캐릭터 이름 추출 - base_session_id: {base_session_id}, character_name: {character_name}")
+            session_id = base_session_id
     
     # 메모리에 없으면 PostgreSQL에서 로드 시도
     # 벡터 스토어도 원본 session_id로 찾기 시도
@@ -641,19 +875,29 @@ async def chat(request: ChatRequest):
             )
     
     # 시스템 프롬프트 로드 (메모리에 없으면 PostgreSQL에서 로드)
-    if session_id not in system_prompts:
-        session_info = load_session_info(session_id)
+    # 키를 session_id:character_name 형태로 사용
+    prompt_key = f"{session_id}:{character_name}"
+    if prompt_key not in system_prompts:
+        session_info = load_session_info(session_id, character_name)
         if session_info:
-            system_prompts[session_id] = session_info['system_prompt']
-            logger.info(f"PostgreSQL에서 시스템 프롬프트 로드 완료 - session_id: {session_id}")
+            system_prompts[prompt_key] = session_info['system_prompt']
+            logger.info(f"PostgreSQL에서 시스템 프롬프트 로드 완료 - session_id: {session_id}, character_name: {character_name}")
             logger.debug(f"로드된 프롬프트에 context 변수 있는지: {'{context}' in session_info['system_prompt']}")
         else:
-            logger.warning(f"⚠️ 세션 정보를 찾을 수 없습니다 - session_id: {session_id}")
+            logger.warning(f"⚠️ 세션 정보를 찾을 수 없습니다 - session_id: {session_id}, character_name: {character_name}")
             logger.warning("기본 프롬프트를 사용하지만, context가 없어 스토리 내용이 반영되지 않을 수 있습니다.")
 
     try:
         retriever = vector_store_mapping[session_id]
-        template = system_prompts.get(session_id, "당신은 도움이 되는 챗봇입니다.")
+        template = system_prompts.get(prompt_key, f"""당신은 소설 속 인물 '{character_name}'입니다. 당신은 이제 게임 속 NPC로서 플레이어와 직접 대화하고 있습니다.
+
+**대화 규칙:**
+1. 캐릭터로서 직접 말하세요. 3인칭 설명 절대 금지.
+2. 설명하는 AI가 아니라 살아있는 캐릭터처럼 자연스럽게 대화하세요.
+3. "{character_name}는..."이 아니라 "나는..."이라고 말하세요.
+
+[Context]:
+{{context}}""")
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", template),
@@ -661,7 +905,8 @@ async def chat(request: ChatRequest):
         ])
         
         # 서버의 환경변수 키 사용
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.7, openai_api_key=OPENAI_API_KEY)
+        # temperature를 높여서 더 자연스럽고 창의적인 NPC 대화 가능하게 설정
+        llm = ChatOpenAI(model="gpt-4o", temperature=0.8, openai_api_key=OPENAI_API_KEY)
 
         def format_docs(docs):
             formatted = "\n\n".join(doc.page_content for doc in docs)

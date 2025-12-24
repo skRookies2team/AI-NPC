@@ -123,59 +123,111 @@ app.post('/api/train-from-s3', async (req, res) => {
     }
 });
 
-// 3. 기존 방식 (하위 호환성 유지)
+// 3. 기존 방식 (하위 호환성 유지 - 테스트용)
+// 주의: 이 엔드포인트는 테스트용이며, 실제 운영에서는 S3 방식을 사용하세요
+// character_name 없이 소설만 학습 (실제 서비스 환경처럼)
 app.post('/upload', upload.single('file'), async (req, res) => {
     try {
-        const { character_name } = req.body;
         const file = req.file;
 
         if (!file) return res.status(400).json({ success: false, message: "파일이 없습니다." });
 
         // 세션 ID 생성
         const session_id = 'sess_' + Date.now();
-
-        // Python 서버로 전송할 폼 데이터 구성
-        const formData = new FormData();
-        formData.append('file', fs.createReadStream(file.path));
-        formData.append('character_name', character_name);
-        formData.append('session_id', session_id);
-
-        // AI 서버로 요청 (API Key는 AI 서버가 가지고 있음)
-        const response = await axios.post(`${AI_SERVER_URL}/api/ai/train`, formData, {
-            headers: { ...formData.getHeaders() }
-        });
-
-        // 임시 파일 정리
+        
+        // 파일 내용 읽기
+        const fileContent = fs.readFileSync(file.path, 'utf-8');
+        
+        // 원본 임시 파일 삭제
         fs.unlinkSync(file.path);
+
+        // AI 서버로 텍스트 내용 직접 전송 (테스트용)
+        // character_name 없이 소설만 학습 (나중에 /api/ai/character에서 설정)
+        const response = await axios.post(`${AI_SERVER_URL}/api/ai/train-text`, {
+            session_id: session_id,
+            content: fileContent,
+            character_name: ""  // 빈 값으로 전송 (나중에 character 엔드포인트에서 설정)
+        });
 
         res.json({ 
             success: true, 
-            message: '캐릭터 생성 완료!', 
+            message: '소설 학습 완료! 이제 캐릭터를 설정하세요.', 
             session_id: session_id 
         });
 
     } catch (error) {
-        console.error('AI Server Error:', error.message);
-        if(req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
-        res.status(500).json({ success: false, message: '학습 중 오류 발생' });
+        console.error('Upload Error:', error.message);
+        if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+        res.status(500).json({ 
+            success: false, 
+            message: '학습 중 오류 발생: ' + error.message 
+        });
+    }
+});
+
+// 4. 캐릭터 설정 엔드포인트 (실제 서비스 환경)
+app.post('/api/character', async (req, res) => {
+    try {
+        const { session_id, character_name, character_description } = req.body;
+
+        if (!session_id || !character_name) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'session_id와 character_name이 필요합니다.' 
+            });
+        }
+
+        // AI 서버로 캐릭터 설정 요청
+        const response = await axios.post(`${AI_SERVER_URL}/api/ai/character`, {
+            session_id: session_id,
+            character_name: character_name,
+            character_description: character_description || ""
+        });
+
+        res.json({
+            success: true,
+            message: '캐릭터 설정 완료!',
+            ...response.data
+        });
+
+    } catch (error) {
+        console.error('Character 설정 오류:', error.message);
+        res.status(500).json({ 
+            success: false, 
+            message: '캐릭터 설정 중 오류 발생: ' + (error.response?.data?.detail || error.message) 
+        });
     }
 });
 
 // 2. 채팅 요청 (API Key 불필요)
 app.post('/chat', async (req, res) => {
     try {
-        const { message, session_id } = req.body;
+        const { message, session_id, character_name } = req.body;
+
+        if (!message || !session_id || !character_name) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'message, session_id, character_name이 모두 필요합니다.' 
+            });
+        }
 
         // AI 서버로 메시지 전달
         const response = await axios.post(`${AI_SERVER_URL}/api/ai/chat`, {
             message,
-            session_id
+            session_id,
+            character_name
         });
 
         res.json(response.data);
 
     } catch (error) {
         console.error('Chat Error:', error.message);
+        if (error.response) {
+            console.error('AI Server Response:', error.response.data);
+            return res.status(error.response.status).json({ 
+                reply: error.response.data.detail || '오류가 발생했습니다.' 
+            });
+        }
         res.status(500).json({ reply: '오류가 발생했습니다.' });
     }
 });

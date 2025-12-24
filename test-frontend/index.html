@@ -5,28 +5,39 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI 소설 캐릭터 챗봇</title>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f3f4f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-        .container { width: 100%; max-width: 450px; background: white; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); overflow: hidden; display: flex; flex-direction: column; height: 80vh; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: #f3f4f6; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; }
+        .container { width: 100%; max-width: 500px; background: white; border-radius: 16px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); overflow: hidden; display: flex; flex-direction: column; min-height: 600px; }
         header { background-color: #6366f1; color: white; padding: 15px; text-align: center; font-weight: bold; }
         
-        /* 설정 화면 */
-        #setup-section { padding: 30px; display: flex; flex-direction: column; gap: 15px; justify-content: center; height: 100%; }
+        /* 단계별 섹션 */
+        .section { padding: 30px; display: none; flex-direction: column; gap: 15px; flex: 1; }
+        .section.active { display: flex; }
+        
+        /* 스텝 1: 소설 업로드 */
+        #upload-section { justify-content: center; }
         input[type="text"], input[type="file"] { width: 100%; padding: 12px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; }
         button { background-color: #6366f1; color: white; border: none; padding: 12px; border-radius: 8px; cursor: pointer; font-size: 1rem; font-weight: bold; transition: 0.2s; }
         button:hover { background-color: #4f46e5; }
         button:disabled { background-color: #a5a6f6; cursor: not-allowed; }
-
+        .char-btn { background-color: #f3f4f6; color: #333; margin: 5px; padding: 10px 15px; border-radius: 8px; border: 2px solid #e5e7eb; }
+        .char-btn:hover { background-color: #e5e7eb; border-color: #6366f1; }
+        .char-btn.selected { background-color: #6366f1; color: white; border-color: #6366f1; }
+        
         /* 채팅 화면 */
         #chat-section { display: none; flex-direction: column; height: 100%; }
-        #chat-box { flex: 1; padding: 20px; overflow-y: auto; background-color: #fff; display: flex; flex-direction: column; gap: 10px; }
+        #chat-header { padding: 10px 15px; background-color: #f9fafb; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; align-items: center; }
+        #character-selector { padding: 10px 15px; background-color: #f9fafb; border-bottom: 1px solid #eee; display: flex; gap: 10px; flex-wrap: wrap; }
+        #chat-box { flex: 1; padding: 20px; overflow-y: auto; background-color: #fff; display: flex; flex-direction: column; gap: 10px; min-height: 300px; }
         .message { max-width: 80%; padding: 10px 15px; border-radius: 15px; font-size: 0.95rem; line-height: 1.4; word-wrap: break-word; }
         .bot-msg { align-self: flex-start; background-color: #f3f4f6; color: #333; border-bottom-left-radius: 2px; }
         .user-msg { align-self: flex-end; background-color: #e0e7ff; color: #3730a3; border-bottom-right-radius: 2px; }
+        .message-label { font-size: 0.75rem; color: #888; margin-bottom: 5px; }
         
         .input-area { padding: 15px; border-top: 1px solid #eee; display: flex; gap: 10px; }
-        .input-area input { flex: 1; border-radius: 20px; outline: none; }
+        .input-area input { flex: 1; border-radius: 20px; outline: none; padding: 10px 15px; border: 1px solid #ddd; }
         .input-area button { border-radius: 20px; width: 80px; }
         .loading { font-size: 0.8rem; color: #888; margin-left: 20px; display: none; }
+        .status-msg { text-align: center; font-size: 0.9rem; color: #666; margin-top: 10px; }
     </style>
 </head>
 <body>
@@ -34,19 +45,40 @@
 <div class="container">
     <header>📚 Novel Persona Chat</header>
 
-    <div id="setup-section">
-        <h3>캐릭터 생성</h3>
-        <input type="text" id="charName" placeholder="주인공 이름 (예: 해리포터)">
+    <!-- 스텝 1: 소설 업로드 -->
+    <div id="upload-section" class="section active">
+        <h3>1단계: 소설 업로드</h3>
         <input type="file" id="novelFile" accept=".txt">
-        <button id="startBtn" onclick="uploadAndStart()">대화 시작하기</button>
-        <p id="status-msg" style="text-align: center; font-size: 0.9rem; color: #666;"></p>
+        <button id="uploadBtn" onclick="uploadNovel()">소설 학습하기</button>
+        <p id="upload-status" class="status-msg"></p>
     </div>
 
-    <div id="chat-section">
-        <div id="session-info" style="padding: 10px 15px; background-color: #f9fafb; border-bottom: 1px solid #eee; font-size: 0.85rem; color: #666;">
-            <strong>세션 ID:</strong> <span id="session-id-display" style="font-family: monospace; color: #6366f1;">-</span>
-            <button onclick="copySessionId()" style="margin-left: 10px; padding: 4px 8px; font-size: 0.75rem; background-color: #6366f1; color: white; border: none; border-radius: 4px; cursor: pointer;">복사</button>
+    <!-- 스텝 2: 캐릭터 선택 -->
+    <div id="character-section" class="section">
+        <h3>2단계: 캐릭터 선택 (최대 2명)</h3>
+        <div id="character-list" style="display: flex; flex-direction: column; gap: 10px;">
+            <!-- 캐릭터 입력 폼 -->
+            <div style="display: flex; gap: 10px;">
+                <input type="text" id="newCharName" placeholder="캐릭터 이름 (예: 해리포터)" style="flex: 1;">
+                <input type="text" id="newCharDesc" placeholder="캐릭터 설명 (선택)" style="flex: 1;">
+                <button onclick="addCharacter()">추가</button>
+            </div>
+            <!-- 추가된 캐릭터 목록 -->
+            <div id="selected-characters" style="display: flex; flex-direction: column; gap: 10px;"></div>
         </div>
+        <button id="startChatBtn" onclick="startChat()" disabled>대화 시작하기</button>
+        <p id="character-status" class="status-msg"></p>
+    </div>
+
+    <!-- 스텝 3: 채팅 -->
+    <div id="chat-section">
+        <div id="chat-header">
+            <div>
+                <strong>세션 ID:</strong> <span id="session-id-display" style="font-family: monospace; color: #6366f1;">-</span>
+            </div>
+            <button onclick="resetChat()" style="padding: 5px 10px; font-size: 0.85rem; background-color: #ef4444; color: white; border: none; border-radius: 4px; cursor: pointer;">처음부터</button>
+        </div>
+        <div id="character-selector"></div>
         <div id="chat-box"></div>
         <div id="loading" class="loading">답변 작성 중...</div>
         <div class="input-area">
@@ -57,27 +89,30 @@
 </div>
 
 <script>
-    const BACKEND_URL = "http://localhost:3000"; // Node.js 서버 주소
+    const BACKEND_URL = "http://localhost:3000";
+    const AI_SERVER_URL = "http://localhost:8002";
     let currentSessionId = null;
+    let selectedCharacters = []; // [{name, description}, ...]
+    let currentCharacterName = null; // 현재 대화 중인 캐릭터
 
-    async function uploadAndStart() {
-        const charName = document.getElementById('charName').value;
+    // 스텝 1: 소설 업로드
+    async function uploadNovel() {
         const fileInput = document.getElementById('novelFile');
-        const btn = document.getElementById('startBtn');
-        const status = document.getElementById('status-msg');
+        const btn = document.getElementById('uploadBtn');
+        const status = document.getElementById('upload-status');
 
-        if (!charName || !fileInput.files[0]) {
-            alert("이름과 파일을 모두 입력해주세요.");
+        if (!fileInput.files[0]) {
+            alert("소설 파일을 선택해주세요.");
             return;
         }
 
         btn.disabled = true;
         btn.innerText = "학습 중...";
-        status.innerText = "소설을 읽고 캐릭터를 만드는 중입니다...";
+        status.innerText = "소설을 읽고 학습하는 중입니다...";
 
         const formData = new FormData();
         formData.append("file", fileInput.files[0]);
-        formData.append("character_name", charName);
+        // character_name 없이 소설만 학습
 
         try {
             const response = await fetch(`${BACKEND_URL}/upload`, {
@@ -88,11 +123,11 @@
 
             if (data.success) {
                 currentSessionId = data.session_id;
-                // 세션 ID 표시
-                document.getElementById('session-id-display').textContent = currentSessionId;
-                document.getElementById('setup-section').style.display = 'none';
-                document.getElementById('chat-section').style.display = 'flex';
-                addMessage('bot', `안녕! 나는 ${charName}. 무엇이 궁금해?`);
+                status.innerText = "소설 학습 완료! 이제 캐릭터를 추가하세요.";
+                
+                // 스텝 2로 이동
+                document.getElementById('upload-section').classList.remove('active');
+                document.getElementById('character-section').classList.add('active');
             } else {
                 alert("실패: " + data.message);
                 btn.disabled = false;
@@ -104,12 +139,137 @@
         }
     }
 
+    // 스텝 2: 캐릭터 추가
+    function addCharacter() {
+        const nameInput = document.getElementById('newCharName');
+        const descInput = document.getElementById('newCharDesc');
+        const name = nameInput.value.trim();
+        const desc = descInput.value.trim();
+
+        if (!name) {
+            alert("캐릭터 이름을 입력해주세요.");
+            return;
+        }
+
+        if (selectedCharacters.length >= 2) {
+            alert("최대 2명의 캐릭터만 추가할 수 있습니다.");
+            return;
+        }
+
+        if (selectedCharacters.some(c => c.name === name)) {
+            alert("이미 추가된 캐릭터입니다.");
+            return;
+        }
+
+        selectedCharacters.push({ name, description: desc });
+        updateCharacterList();
+        
+        nameInput.value = '';
+        descInput.value = '';
+        document.getElementById('startChatBtn').disabled = selectedCharacters.length === 0;
+    }
+
+    function removeCharacter(name) {
+        selectedCharacters = selectedCharacters.filter(c => c.name !== name);
+        updateCharacterList();
+        document.getElementById('startChatBtn').disabled = selectedCharacters.length === 0;
+    }
+
+    function updateCharacterList() {
+        const container = document.getElementById('selected-characters');
+        container.innerHTML = selectedCharacters.map(char => `
+            <div style="padding: 10px; border: 1px solid #ddd; border-radius: 8px; display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <strong>${char.name}</strong>
+                    ${char.description ? `<div style="font-size: 0.85rem; color: #666;">${char.description}</div>` : ''}
+                </div>
+                <button onclick="removeCharacter('${char.name}')" style="padding: 5px 10px; background-color: #ef4444; color: white; border: none; border-radius: 4px; cursor: pointer;">삭제</button>
+            </div>
+        `).join('');
+    }
+
+    // 스텝 2 → 3: 캐릭터 설정 후 대화 시작
+    async function startChat() {
+        if (selectedCharacters.length === 0) {
+            alert("최소 1명의 캐릭터를 추가해주세요.");
+            return;
+        }
+
+        const status = document.getElementById('character-status');
+        const btn = document.getElementById('startChatBtn');
+        
+        btn.disabled = true;
+        status.innerText = "캐릭터를 설정하는 중...";
+
+        try {
+            // 각 캐릭터에 대해 /api/character 호출
+            for (const char of selectedCharacters) {
+                const response = await fetch(`${BACKEND_URL}/api/character`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        session_id: currentSessionId,
+                        character_name: char.name,
+                        character_description: char.description || ""
+                    })
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.message || "캐릭터 설정 실패");
+                }
+            }
+
+            // 채팅 화면으로 이동
+            document.getElementById('character-section').classList.remove('active');
+            document.getElementById('chat-section').style.display = 'flex';
+            document.getElementById('session-id-display').textContent = currentSessionId;
+            
+            // 캐릭터 선택 버튼 생성
+            updateCharacterSelector();
+            
+            // 첫 번째 캐릭터 선택
+            if (selectedCharacters.length > 0) {
+                selectCharacter(selectedCharacters[0].name);
+                addMessage('bot', `안녕! 나는 ${selectedCharacters[0].name}. 무엇이 궁금해?`, selectedCharacters[0].name);
+            }
+
+        } catch (error) {
+            console.error(error);
+            alert("캐릭터 설정 실패: " + error.message);
+            btn.disabled = false;
+        }
+    }
+
+    function updateCharacterSelector() {
+        const selector = document.getElementById('character-selector');
+        selector.innerHTML = selectedCharacters.map(char => `
+            <button class="char-btn ${currentCharacterName === char.name ? 'selected' : ''}" 
+                    onclick="selectCharacter('${char.name}')">
+                ${char.name}
+            </button>
+        `).join('');
+    }
+
+    function selectCharacter(name) {
+        currentCharacterName = name;
+        updateCharacterSelector();
+        // 채팅창에 캐릭터 변경 메시지 추가
+        addMessage('system', `${name}와(과) 대화 중...`, name);
+    }
+
+    // 채팅 메시지 전송
     async function sendMessage() {
         const input = document.getElementById('userMessage');
         const message = input.value.trim();
         if (!message) return;
+        
+        if (!currentSessionId || !currentCharacterName) {
+            alert("캐릭터를 선택해주세요.");
+            return;
+        }
 
-        addMessage('user', message);
+        addMessage('user', message, currentCharacterName);
         input.value = '';
         document.getElementById('loading').style.display = 'block';
 
@@ -119,42 +279,48 @@
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     message: message,
-                    session_id: currentSessionId
+                    session_id: currentSessionId,
+                    character_name: currentCharacterName
                 })
             });
             const data = await response.json();
             
             document.getElementById('loading').style.display = 'none';
-            addMessage('bot', data.reply);
+            addMessage('bot', data.reply, currentCharacterName);
         } catch (error) {
             document.getElementById('loading').style.display = 'none';
-            addMessage('bot', "통신 오류가 발생했습니다.");
+            addMessage('bot', "통신 오류가 발생했습니다.", currentCharacterName);
         }
     }
 
-    function addMessage(sender, text) {
+    function addMessage(sender, text, characterName = null) {
         const chatBox = document.getElementById('chat-box');
         const div = document.createElement('div');
-        div.className = `message ${sender === 'user' ? 'user-msg' : 'bot-msg'}`;
-        div.innerText = text;
+        div.style.display = 'flex';
+        div.style.flexDirection = 'column';
+        div.style.alignSelf = sender === 'user' ? 'flex-end' : 'flex-start';
+        div.style.maxWidth = '80%';
+        
+        if (characterName && sender === 'bot') {
+            const label = document.createElement('div');
+            label.className = 'message-label';
+            label.textContent = characterName;
+            div.appendChild(label);
+        }
+        
+        const msgDiv = document.createElement('div');
+        msgDiv.className = `message ${sender === 'user' ? 'user-msg' : sender === 'system' ? 'bot-msg' : 'bot-msg'}`;
+        msgDiv.style.opacity = sender === 'system' ? '0.7' : '1';
+        msgDiv.innerText = text;
+        div.appendChild(msgDiv);
+        
         chatBox.appendChild(div);
         chatBox.scrollTop = chatBox.scrollHeight;
     }
 
-    function copySessionId() {
-        if (currentSessionId) {
-            navigator.clipboard.writeText(currentSessionId).then(() => {
-                const btn = event.target;
-                const originalText = btn.textContent;
-                btn.textContent = '복사됨!';
-                btn.style.backgroundColor = '#10b981';
-                setTimeout(() => {
-                    btn.textContent = originalText;
-                    btn.style.backgroundColor = '#6366f1';
-                }, 2000);
-            }).catch(err => {
-                alert('복사 실패: ' + err);
-            });
+    function resetChat() {
+        if (confirm("처음부터 다시 시작하시겠습니까?")) {
+            location.reload();
         }
     }
 </script>
